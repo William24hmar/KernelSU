@@ -15,19 +15,17 @@
 // enabled by default
 static bool ksu_selinux_hide_enabled __read_mostly = true;
 
-// sids for avc spoofing
-static u32 su_sid __read_mostly = 0;
+// sids for avc omit
+// TODO: move to a linked list / sidtab
+// basically, grab class and types on ksu_type_node
 static u32 ksu_sid __read_mostly = 0;
 static u32 priv_app_sid __read_mostly = 0;
+static u32 lsposed_file_sid __read_mostly = 0;
 
 static inline int ksu_selinux_get_sids()
 {
 	// dont load at all if we cant get sids
-	int err = security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &su_sid);
-	if (!err)
-		pr_info("selinux_hide: su_sid: %u\n", su_sid);
-
-	err = security_secctx_to_secid("u:r:ksu:s0", strlen("u:r:ksu:s0"), &ksu_sid);
+	int err = security_secctx_to_secid("u:r:ksu:s0", strlen("u:r:ksu:s0"), &ksu_sid);
 	if (!err)
 		pr_info("selinux_hide: ksu_sid: %u\n", ksu_sid);
 
@@ -35,7 +33,11 @@ static inline int ksu_selinux_get_sids()
 	if (!err)
 		pr_info("selinux_hide: priv_app_sid: %u\n", priv_app_sid);
 
-	if (!su_sid || !ksu_sid || !priv_app_sid)
+	err = security_secctx_to_secid("u:object_r:lsposed_file:s0", strlen("u:object_r:lsposed_file:s0"), &lsposed_file_sid);
+	if (!err)
+		pr_info("selinux_hide: lsposed_file_sid: %u\n", lsposed_file_sid);
+
+	if (!ksu_sid || !priv_app_sid || !lsposed_file_sid)
 		return -1;
 
 	return 0;
@@ -47,7 +49,7 @@ int ksu_handle_slow_avc_audit_new(u32 tsid, u16 *tclass)
 	if (!ksu_selinux_hide_enabled)
 		return 0;
 
-	if (tsid != su_sid && tsid != ksu_sid)
+	if (tsid != ksu_sid)
 		return 0;
 
 	pr_info("selinux_hide: prevent log for sid: %u\n", tsid);
@@ -61,14 +63,31 @@ void ksu_slow_avc_audit(u32 *tsid)
 	if (!ksu_selinux_hide_enabled)
 		return;
 
-	// if tsid is su, we just replace it
-	// unsure if its enough, but this is how it is aye?
-	if (*tsid == su_sid || *tsid == ksu_sid) {
+	if (*tsid == ksu_sid) {
 		pr_info("selinux_hide: slow_avc_audit: replace tsid: %u with priv_app_sid: %u\n", *tsid, priv_app_sid);
 		*tsid = priv_app_sid;
 	}
 
 	return;
+}
+
+bool ksu_slow_avc_audit_full(u32 *ssid, u32 *tsid, u16 *tclass, u32 *requested,
+				u32 *audited, u32 *denied, int *result, void **a)
+{
+	if (!ksu_selinux_hide_enabled)
+		return true;
+
+	if (*tsid == ksu_sid) {
+		pr_info("selinux_hide: slow_avc_audit: replace tsid: %u with priv_app_sid: %u\n", *tsid, priv_app_sid);
+		return true; // we only mutate, keep log output!
+	}
+
+	if (*tsid == lsposed_file_sid) {
+		pr_info("selinux_hide: slow_avc_audit: prevent output for tsid: %u\n", *tsid);
+		return false;
+	}
+
+	return true;
 }
 
 static inline bool ksu_should_destroy_context(char *str)
@@ -190,23 +209,8 @@ void ksu_sel_write_context(struct file **file, char **buf, size_t *size)
 #if defined(CONFIG_KPROBES)
 
 #include <linux/kprobes.h>
-static struct kprobe *slow_avc_audit_kp;
 static struct kprobe *sel_write_context_kp;
 static struct kprobe *sel_write_access_kp;
-
-static int slow_avc_audit_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-
-#if defined(KSU_COMPAT_HAS_SELINUX_STATE)
-	u32 *tsid = (u32 *)&PT_REGS_PARM3(regs);
-#else
-	u32 *tsid = (u32 *)&PT_REGS_PARM2(regs);
-#endif
-
-	ksu_slow_avc_audit(tsid);
-
-	return 0;
-}
 
 static int sel_write_context_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
@@ -315,8 +319,6 @@ static void ksu_selinux_hide_enable()
 		pr_info("selinux_hide: sid grab fail?\n");
 
 #if defined(CONFIG_KPROBES)
-	slow_avc_audit_kp = init_kprobe("slow_avc_audit", slow_avc_audit_pre_handler);
-
 	sel_write_context_kp = init_kprobe("sel_write_context", sel_write_context_pre_handler);
 	sel_write_access_kp = init_kprobe("sel_write_access", sel_write_context_pre_handler);
 #endif
@@ -329,9 +331,6 @@ static void ksu_selinux_hide_enable()
 static void ksu_selinux_hide_disable()
 {
 #if defined(CONFIG_KPROBES)
-	pr_info("selinux_hide: unregister slow_avc_audit kprobe!\n");
-	destroy_kprobe(&slow_avc_audit_kp);
-
 	pr_info("selinux_hide: unregister sel_write_context kprobe!\n");
 	destroy_kprobe(&sel_write_context_kp);
 
@@ -364,17 +363,15 @@ start:
 
 bail:
 	;
-	// apply_kernelsu_rules_fn
 	const char *ksu_domain_args[] = { KERNEL_SU_DOMAIN, NULL };
-	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, ksu_domain_args);
-
 	const char *ksu_file_args[] = { KERNEL_SU_FILE, NULL };
+	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, ksu_domain_args);
 	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, ksu_file_args);
 
+	// apply_kernelsu_rules_fn
 	const char *init_adb_args[] = { "init", "adb_data_file", NULL };
 	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_NORMAL_PERM, init_adb_args);
 
-	// extra, but lets take care of this
 	const char *adbroot_args[] = { "adbroot", NULL };
 	ksu_add_shit_to_list(KSU_SEPOLICY_CMD_TYPE, adbroot_args);
 
